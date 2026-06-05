@@ -12,6 +12,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
+import pulp
+
+# One-way: laadverliezen = 0, ontlaadverliezen = (1-η)·d_gross.
+# Consistent met greedy simulate() en §8.7-validatieankers.
+_EFF_CONVENTION = "one-way"
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +66,29 @@ class FinancialParams:
     discount_rate: float = 0.06          # voor NPV
     td_surcharge: float = 1.3            # T&D-opslag op netafname (kostkant DA-laden)
     feed_in_tariff_eur_per_mwh: float = None  # vergoeding injectie; None = geen
+
+
+@dataclass
+class TariffParams:
+    """Belgische tariefstructuur voor LP-kostenoptimalisatie (§8.1)."""
+    netkost_afname_eur_kwh: float
+    toeslagen_afname_eur_kwh: float
+    netkost_injectie_eur_kwh: float
+    injectievergoeding_basis: str               # 'da' | 'vast'
+    injectievergoeding_vast_eur_kwh: float | None
+    injectie_da_factor: float = 1.0
+    capaciteitstarief_eur_kw_maand: float = 0.0
+    cap_min_piek_kw: float = 2.5
+    databeheer_eur_jaar: float = 0.0
+
+    def injectie_vergoeding_per_kwh(self, da_eur_kwh: float) -> float:
+        """
+        Netto vergoeding per kWh geïnjecteerde energie.
+        netkost_injectie_eur_kwh wordt ALLEEN hier afgetrokken — nooit elders.
+        """
+        if self.injectievergoeding_basis == "da":
+            return da_eur_kwh * self.injectie_da_factor - self.netkost_injectie_eur_kwh
+        return self.injectievergoeding_vast_eur_kwh - self.netkost_injectie_eur_kwh
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +315,332 @@ def irr_calc(cashflows: list[float], guess: float = 0.1) -> float | None:
             return new
         rate = new
     return rate if -0.999 < rate < 10 else None
+
+
+# Alias voor regressievergelijking
+simulate_greedy = simulate
+
+
+# ---------------------------------------------------------------------------
+# LP-dispatch helpers
+# ---------------------------------------------------------------------------
+
+_LP_TIMELIMIT = 120  # CBC timeout in seconden per kalendermaand
+
+
+def _solve_month_lp(
+    prod_m: np.ndarray,
+    cons_m: np.ndarray,
+    da_m: np.ndarray,
+    battery: BatteryParams,
+    tariff: TariffParams,
+    soc_start: float,
+    maand_label: str,
+) -> tuple[dict[str, np.ndarray], float]:
+    """
+    Löst één LP voor een kalendermaand. Retourneert (resultaat_dict, soc_einde).
+
+    Efficiëntie-conventie: one-way (zie _EFF_CONVENTION).
+    - Laden: volledig naar SOC (geen laadverlies).
+    - Ontladen: d_gross daalt van SOC; netto geleverd = d_gross * η.
+    - SOC: soc[t] = soc[t-1] + c_pv[t] + c_grid[t] - d_self[t] - d_inj[t]
+    - Energiebalans: g_imp - g_exp = cons - prod + c_pv + c_grid - (d_self+d_inj)*η
+    """
+    n = len(prod_m)
+    cap = battery.capacity_kwh
+    floor = battery.floor_kwh
+    eff = battery.efficiency
+    plim = battery.power_per_quarter_kwh
+    netkost = tariff.netkost_afname_eur_kwh
+    toes = tariff.toeslagen_afname_eur_kwh
+    cap_tar = tariff.capaciteitstarief_eur_kw_maand
+
+    prob = pulp.LpProblem(f"bess_{maand_label}", pulp.LpMinimize)
+
+    c_pv   = [pulp.LpVariable(f"c_pv_{t}",   lowBound=0) for t in range(n)]
+    c_grid = [pulp.LpVariable(f"c_grid_{t}", lowBound=0) for t in range(n)]
+    d_self = [pulp.LpVariable(f"d_self_{t}", lowBound=0) for t in range(n)]
+    d_inj  = [pulp.LpVariable(f"d_inj_{t}",  lowBound=0) for t in range(n)]
+    soc    = [pulp.LpVariable(f"soc_{t}",    lowBound=floor, upBound=cap) for t in range(n)]
+    g_imp  = [pulp.LpVariable(f"g_imp_{t}",  lowBound=0) for t in range(n)]
+    g_exp  = [pulp.LpVariable(f"g_exp_{t}",  lowBound=0) for t in range(n)]
+    peak   = pulp.LpVariable("peak", lowBound=tariff.cap_min_piek_kw)
+
+    # Doelfunctie (€/kWh; DA in €/MWh → /1000)
+    prob += (
+        pulp.lpSum(
+            g_imp[t] * (da_m[t] / 1000.0 + netkost + toes)
+            - g_exp[t] * tariff.injectie_vergoeding_per_kwh(da_m[t] / 1000.0)
+            for t in range(n)
+        )
+        + peak * cap_tar
+    )
+
+    for t in range(n):
+        pv_overschot = max(prod_m[t] - cons_m[t], 0.0)
+        rest_vraag   = max(cons_m[t] - prod_m[t], 0.0)
+
+        # SOC-continuïteit
+        soc_prev = soc_start if t == 0 else soc[t - 1]
+        prob += soc[t] == soc_prev + c_pv[t] + c_grid[t] - d_self[t] - d_inj[t]
+
+        # Vermogenslimieten
+        prob += c_pv[t] + c_grid[t] <= plim
+        prob += d_self[t] + d_inj[t] <= plim
+
+        # PV-laden ≤ PV-overschot
+        prob += c_pv[t] <= pv_overschot
+
+        # Eigenverbruiksontlading ≤ resterende vraag (netto geleverd = d_self·η)
+        prob += d_self[t] * eff <= rest_vraag
+
+        # Energiebalans aansluitpunt
+        # g_imp - g_exp = cons - prod + c_pv + c_grid - (d_self + d_inj)*η
+        prob += (
+            g_imp[t] - g_exp[t]
+            == cons_m[t] - prod_m[t] + c_pv[t] + c_grid[t]
+            - (d_self[t] + d_inj[t]) * eff
+        )
+
+        # Maandpiek: peak ≥ g_imp[t] / 0.25h (kW)
+        prob += peak >= g_imp[t] / 0.25
+
+    prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=_LP_TIMELIMIT))
+
+    if pulp.LpStatus[prob.status] != "Optimal":
+        raise RuntimeError(
+            f"LP maand {maand_label}: status={pulp.LpStatus[prob.status]}. "
+            "Controleer inputdata of vergroot timeLimit."
+        )
+
+    def v(var_list):
+        return np.array([pulp.value(x) or 0.0 for x in var_list])
+
+    res = {
+        "c_pv":   v(c_pv),
+        "c_grid": v(c_grid),
+        "d_self": v(d_self),
+        "d_inj":  v(d_inj),
+        "soc":    v(soc),
+        "g_imp":  v(g_imp),
+        "g_exp":  v(g_exp),
+    }
+    soc_end = float(pulp.value(soc[-1]) or 0.0)
+    return res, soc_end
+
+
+def simulate_lp(
+    df: pd.DataFrame,
+    battery: BatteryParams,
+    tariff: TariffParams,
+    da_prices_eur_mwh: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """
+    LP-kostenoptimaliserende BESS-dispatch (Variant A: één LP per kalendermaand).
+
+    Efficiëntie-conventie: one-way (_EFF_CONVENTION). Laden zonder verlies;
+    ontladen levert d·η aan het net/verbruik terwijl de SOC daalt met d (gross).
+
+    Bekende beperking: elke maand wordt onafhankelijk opgelost met vaste SOC-start
+    (carry-over van vorige maand). Maand M optimaliseert niet naar een doelSOC,
+    waardoor het resultaat suboptimaal kan zijn op maandgrenzen (±1 dag effect).
+
+    df: DataFrame met kolommen 'productie', 'consumptie' (kWh/kwartier),
+        optioneel 'da_prijs' (€/MWh) en een DatetimeIndex of 'timestamp'-kolom.
+    """
+    n = len(df)
+    prod = df["productie"].to_numpy(dtype=float)
+    cons = df["consumptie"].to_numpy(dtype=float)
+
+    if da_prices_eur_mwh is not None:
+        da = np.asarray(da_prices_eur_mwh, dtype=float)
+    elif "da_prijs" in df.columns:
+        da = df["da_prijs"].to_numpy(dtype=float)
+    else:
+        da = np.zeros(n)
+
+    # Bepaal maandindex op basis van timestamp
+    if isinstance(df.index, pd.DatetimeIndex):
+        ts = df.index
+    elif "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"])
+    else:
+        ts = pd.date_range("2020-01-01", periods=n, freq="15min")
+
+    month_keys = ts.to_period("M")
+    unique_months = month_keys.unique()
+
+    out_arrays: dict[str, list] = {k: [] for k in
+        ["c_pv", "c_grid", "d_self", "d_inj", "soc", "g_imp", "g_exp"]}
+
+    soc_carry = battery.start_level_kwh
+
+    for mperiod in unique_months:
+        mask = month_keys == mperiod
+        idx = np.where(mask)[0]
+        label = str(mperiod)
+
+        month_res, soc_carry = _solve_month_lp(
+            prod[idx], cons[idx], da[idx],
+            battery, tariff, soc_carry, label,
+        )
+        for k in out_arrays:
+            out_arrays[k].append(month_res[k])
+
+    # Concateneer maanden
+    c_pv   = np.concatenate(out_arrays["c_pv"])
+    c_grid = np.concatenate(out_arrays["c_grid"])
+    d_self = np.concatenate(out_arrays["d_self"])
+    d_inj  = np.concatenate(out_arrays["d_inj"])
+    soc    = np.concatenate(out_arrays["soc"])
+    g_imp  = np.concatenate(out_arrays["g_imp"])
+    g_exp  = np.concatenate(out_arrays["g_exp"])
+
+    eff = battery.efficiency
+    H = prod - cons
+
+    res = df.copy()
+    res["H"]             = H
+    res["charge_pv"]     = c_pv
+    res["charge_da"]     = c_grid
+    res["discharge"]     = -(d_self + d_inj)        # negatief teken, conform greedy
+    res["level"]         = soc
+    res["discharge_self"] = d_self
+    res["discharge_inj"]  = d_inj
+    res["g_imp"]         = g_imp
+    res["g_exp"]         = g_exp
+    res["da_prijs"]      = da
+
+    # Terugwaartse-compatibele kolommen (zelfde definitie als greedy)
+    res["ac_zonder"] = np.where(H < 0, prod, cons)
+    res["ac_met"]    = res["ac_zonder"] + c_pv * eff
+    res["inj_zonder"] = np.clip(H, 0, None)
+    res["inj_met"]    = g_exp
+    res["afn_zonder"] = cons - prod + res["inj_zonder"]
+    res["afn_met"]    = g_imp
+    return res
+
+
+# ---------------------------------------------------------------------------
+# LP-samenvatting met kostensplitsing (§8.5)
+# ---------------------------------------------------------------------------
+
+def summarize_lp(
+    res: pd.DataFrame,
+    battery: BatteryParams,
+    fin: FinancialParams,
+    tariff: TariffParams,
+) -> dict:
+    """
+    Aggregeert LP-simulatie en berekent de kostensplitsing (§8.5).
+
+    netkost_injectie_eur_kwh wordt ALLEEN verrekend via
+    tariff.injectie_vergoeding_per_kwh() — nergens anders afgetrokken.
+    besparing_energie_eur kan negatief zijn als da < 0 (minder importeren
+    terwijl je betaald wordt = gemiste opbrengst).
+    """
+    eff = battery.efficiency
+    to_mwh = 1 / 1000
+
+    prod = res["productie"].to_numpy(dtype=float)
+    cons = res["consumptie"].to_numpy(dtype=float)
+    da   = res["da_prijs"].to_numpy(dtype=float)
+    g_imp_met = res["g_imp"].to_numpy(dtype=float)
+    g_exp_met = res["g_exp"].to_numpy(dtype=float)
+    c_pv   = res["charge_pv"].to_numpy(dtype=float)
+    c_grid = res["charge_da"].to_numpy(dtype=float)
+    d_inj  = res["discharge_inj"].to_numpy(dtype=float)
+
+    g_imp_zonder = np.maximum(cons - prod, 0.0)
+    g_exp_zonder = np.maximum(prod - cons, 0.0)
+
+    # Maandpiek zonder en met batterij
+    if isinstance(res.index, pd.DatetimeIndex):
+        ts = res.index
+    elif "timestamp" in res.columns:
+        ts = pd.to_datetime(res["timestamp"])
+    else:
+        ts = pd.date_range("2020-01-01", periods=len(res), freq="15min")
+
+    month_keys = ts.to_period("M")
+
+    peak_met_list = []
+    peak_zonder_list = []
+    for mperiod in month_keys.unique():
+        mask = np.asarray(month_keys == mperiod)
+        peak_met_list.append(g_imp_met[mask].max() / 0.25)
+        peak_zonder_list.append(g_imp_zonder[mask].max() / 0.25)
+
+    peak_met_total    = sum(max(p, tariff.cap_min_piek_kw) for p in peak_met_list)
+    peak_zonder_total = sum(max(p, tariff.cap_min_piek_kw) for p in peak_zonder_list)
+
+    da_kwh = da / 1000.0
+    inj_verg = np.array([tariff.injectie_vergoeding_per_kwh(d) for d in da_kwh])
+
+    besparing_energie_eur        = float((g_imp_zonder * da_kwh).sum() - (g_imp_met * da_kwh).sum())
+    besparing_netkost_afname_eur = float(((g_imp_zonder - g_imp_met) * tariff.netkost_afname_eur_kwh).sum())
+    besparing_toeslagen_eur      = float(((g_imp_zonder - g_imp_met) * tariff.toeslagen_afname_eur_kwh).sum())
+    besparing_capaciteit_eur     = float(
+        (peak_zonder_total - peak_met_total) * tariff.capaciteitstarief_eur_kw_maand
+    )
+    injectie_opbrengst_eur = float((g_exp_met * inj_verg).sum())
+    arbitrage_marge_eur    = float(
+        (d_inj * eff * inj_verg).sum()
+        - (c_grid * (da_kwh + tariff.netkost_afname_eur_kwh + tariff.toeslagen_afname_eur_kwh)).sum()
+    )
+
+    energy = {
+        "ac_zonder_mwh":  res["ac_zonder"].sum() * to_mwh,
+        "ac_met_mwh":     res["ac_met"].sum() * to_mwh,
+        "inj_zonder_mwh": res["inj_zonder"].sum() * to_mwh,
+        "inj_met_mwh":    res["inj_met"].sum() * to_mwh,
+        "afn_zonder_mwh": res["afn_zonder"].sum() * to_mwh,
+        "afn_met_mwh":    res["afn_met"].sum() * to_mwh,
+        "charge_pv_mwh":  c_pv.sum() * to_mwh,
+        "charge_da_mwh":  c_grid.sum() * to_mwh,
+        "discharge_mwh":  abs(res["discharge"].sum()) * to_mwh,
+    }
+    energy["extra_ac_mwh"] = energy["ac_met_mwh"] - energy["ac_zonder_mwh"]
+
+    battery_cost   = battery.capacity_kwh * fin.battery_price_eur_per_kwh
+    investment     = battery_cost * (1 + fin.install_frac)
+    maintenance_yr = battery_cost * fin.maintenance_frac
+
+    jaarbaten = (
+        besparing_energie_eur
+        + besparing_netkost_afname_eur
+        + besparing_toeslagen_eur
+        + besparing_capaciteit_eur
+        + injectie_opbrengst_eur
+        - maintenance_yr
+    )
+
+    cashflows = [-investment] + [jaarbaten] * fin.lifetime_years
+    npv = npv_calc(fin.discount_rate, cashflows)
+    irr = irr_calc(cashflows)
+    cum = np.cumsum(cashflows)
+    breakeven = next((i for i, v in enumerate(cum) if v >= 0), None)
+    roi = (sum(cashflows[1:]) - investment) / investment if investment else None
+
+    return {
+        "energy": energy,
+        "financial": {
+            "investment_eur":               investment,
+            "maintenance_yr_eur":           maintenance_yr,
+            "besparing_energie_eur":        besparing_energie_eur,
+            "besparing_netkost_afname_eur": besparing_netkost_afname_eur,
+            "besparing_toeslagen_eur":      besparing_toeslagen_eur,
+            "besparing_capaciteit_eur":     besparing_capaciteit_eur,
+            "injectie_opbrengst_eur":       injectie_opbrengst_eur,
+            "arbitrage_marge_eur":          arbitrage_marge_eur,
+            "jaarbaten_eur":                jaarbaten,
+            "npv_eur":                      npv,
+            "irr":                          irr,
+            "breakeven_jaar":               breakeven,
+            "roi":                          roi,
+        },
+        "beperkingen": [
+            "Maandgrens-suboptimaliteit: elke maand onafhankelijk opgelost.",
+            f"Solver timeout per maand: {_LP_TIMELIMIT} s (CBC).",
+        ],
+    }
