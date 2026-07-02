@@ -9,10 +9,19 @@ Rekent in absolute kWh per kwartier (niet per-unit zoals de Excel).
 """
 
 from __future__ import annotations
+import warnings
 from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 import pulp
+
+
+def _maand_periods(ts: pd.DatetimeIndex) -> pd.PeriodIndex:
+    """Kalendermaand-keys; onderdrukt de onschuldige tz-drop-warning van pandas
+    (de index staat al in lokale tijd, precies wat we voor maandgroepering willen)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        return ts.to_period("M")
 
 # One-way: laadverliezen = 0, ontlaadverliezen = (1-η)·d_gross.
 # Consistent met greedy simulate() en §8.7-validatieankers.
@@ -498,7 +507,7 @@ def simulate_lp(
     else:
         ts = pd.date_range("2020-01-01", periods=n, freq="15min")
 
-    month_keys = ts.to_period("M")
+    month_keys = _maand_periods(ts)
     unique_months = month_keys.unique()
 
     out_arrays: dict[str, list] = {k: [] for k in
@@ -593,7 +602,7 @@ def summarize_lp(
     else:
         ts = pd.date_range("2020-01-01", periods=len(res), freq="15min")
 
-    month_keys = ts.to_period("M")
+    month_keys = _maand_periods(ts)
 
     peak_met_list = []
     peak_zonder_list = []
@@ -695,7 +704,7 @@ def summarize_lp(
 
 def _maand_keys(index_of_df) -> pd.PeriodIndex:
     if isinstance(index_of_df, pd.DatetimeIndex):
-        return index_of_df.to_period("M")
+        return _maand_periods(index_of_df)
     raise ValueError("DatetimeIndex vereist voor maandpiekberekening.")
 
 

@@ -80,12 +80,18 @@ def backtest_jaren(
         prijzen = haal_da_prijzen_jaar(jaar)
         df_jaar = _leg_profiel_op_jaar(lookup, prijzen)
         uit = vergelijk_zonder_met(df_jaar, battery, tariff)
-        rijen.append({
+        rij = {
             "jaar": jaar,
             "kost_zonder_eur": uit["zonder"]["totaal_eur"],
             "kost_met_eur": uit["met"]["totaal_eur"],
             "besparing_eur": uit["besparing_eur"],
             "da_gemiddeld_eur_mwh": float(prijzen.mean()),
             "n_kwartieren": len(df_jaar),
-        })
+        }
+        # Kostenuitsplitsing per kant, voor grafieken in het dashboard
+        for kant in ("zonder", "met"):
+            for comp in ("energie_eur", "netkost_var_eur", "capaciteit_eur",
+                         "injectie_opbrengst_eur"):
+                rij[f"{kant}_{comp}"] = uit[kant][comp]
+        rijen.append(rij)
     return pd.DataFrame(rijen).set_index("jaar")
