@@ -91,6 +91,32 @@ class TariffParams:
         return self.injectievergoeding_vast_eur_kwh - self.netkost_injectie_eur_kwh
 
 
+def tariff_simpel(
+    cap_eur_kw_jaar: float = 40.0,
+    var_netkost_eur_kwh: float = 0.003,
+) -> TariffParams:
+    """
+    Vereenvoudigde tariefinvoer met twee velden (dashboard v1).
+
+    cap_eur_kw_jaar: capaciteitstarief op de maandpiek, in €/kW/JAAR.
+        Wordt maandelijks aangerekend als maandpiek × (jaartarief/12) —
+        equivalent met de Fluvius-methodiek (gemiddelde maandpiek × jaartarief).
+    var_netkost_eur_kwh: alle variabele netkosten + taksen samen, €/kWh afname.
+
+    Injectie: vergoeding aan DA-prijs (factor 1,0), geen injectienetkost.
+    """
+    return TariffParams(
+        netkost_afname_eur_kwh=var_netkost_eur_kwh,
+        toeslagen_afname_eur_kwh=0.0,
+        netkost_injectie_eur_kwh=0.0,
+        injectievergoeding_basis="da",
+        injectievergoeding_vast_eur_kwh=None,
+        injectie_da_factor=1.0,
+        capaciteitstarief_eur_kw_maand=cap_eur_kw_jaar / 12.0,
+        cap_min_piek_kw=2.5,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Datavoorbereiding: reconstructie productie/consumptie uit netto meterdata
 # ---------------------------------------------------------------------------
@@ -338,7 +364,7 @@ def _solve_month_lp(
     maand_label: str,
 ) -> tuple[dict[str, np.ndarray], float]:
     """
-    Löst één LP voor een kalendermaand. Retourneert (resultaat_dict, soc_einde).
+    Lost één LP op voor een kalendermaand. Retourneert (resultaat_dict, soc_einde).
 
     Efficiëntie-conventie: one-way (zie _EFF_CONVENTION).
     - Laden: volledig naar SOC (geen laadverlies).
@@ -393,6 +419,11 @@ def _solve_month_lp(
 
         # Eigenverbruiksontlading ≤ resterende vraag (netto geleverd = d_self·η)
         prob += d_self[t] * eff <= rest_vraag
+
+        # Injectie-ontlading moet werkelijk geëxporteerd worden: zonder deze
+        # koppeling zijn d_inj en d_self verwisselbaar in de energiebalans en
+        # ontwijkt de solver de injectiekosten (netkost_injectie).
+        prob += g_exp[t] >= d_inj[t] * eff
 
         # Energiebalans aansluitpunt
         # g_imp - g_exp = cons - prod + c_pv + c_grid - (d_self + d_inj)*η
@@ -583,7 +614,15 @@ def summarize_lp(
     besparing_capaciteit_eur     = float(
         (peak_zonder_total - peak_met_total) * tariff.capaciteitstarief_eur_kw_maand
     )
-    injectie_opbrengst_eur = float((g_exp_met * inj_verg).sum())
+    # Injectie: alleen het VERSCHIL met de batterijloze baseline is een baat.
+    # Zonder batterij injecteert de klant zijn PV-overschot ook en krijgt daar
+    # dezelfde vergoeding voor — die opbrengst mag niet aan de batterij
+    # toegeschreven worden. besparing_injectie_eur is typisch negatief
+    # (batterij absorbeert overschot i.p.v. het te injecteren).
+    injectie_opbrengst_eur        = float((g_exp_met * inj_verg).sum())
+    injectie_opbrengst_zonder_eur = float((g_exp_zonder * inj_verg).sum())
+    besparing_injectie_eur        = injectie_opbrengst_eur - injectie_opbrengst_zonder_eur
+
     arbitrage_marge_eur    = float(
         (d_inj * eff * inj_verg).sum()
         - (c_grid * (da_kwh + tariff.netkost_afname_eur_kwh + tariff.toeslagen_afname_eur_kwh)).sum()
@@ -606,12 +645,14 @@ def summarize_lp(
     investment     = battery_cost * (1 + fin.install_frac)
     maintenance_yr = battery_cost * fin.maintenance_frac
 
+    # jaarbaten = werkelijke kostendelta (kost zonder − kost met batterij).
+    # De vijf besparingscomponenten sommeren algebraïsch exact tot die delta.
     jaarbaten = (
         besparing_energie_eur
         + besparing_netkost_afname_eur
         + besparing_toeslagen_eur
         + besparing_capaciteit_eur
-        + injectie_opbrengst_eur
+        + besparing_injectie_eur
         - maintenance_yr
     )
 
@@ -631,7 +672,9 @@ def summarize_lp(
             "besparing_netkost_afname_eur": besparing_netkost_afname_eur,
             "besparing_toeslagen_eur":      besparing_toeslagen_eur,
             "besparing_capaciteit_eur":     besparing_capaciteit_eur,
+            "besparing_injectie_eur":       besparing_injectie_eur,
             "injectie_opbrengst_eur":       injectie_opbrengst_eur,
+            "injectie_opbrengst_zonder_eur": injectie_opbrengst_zonder_eur,
             "arbitrage_marge_eur":          arbitrage_marge_eur,
             "jaarbaten_eur":                jaarbaten,
             "npv_eur":                      npv,
@@ -643,4 +686,115 @@ def summarize_lp(
             "Maandgrens-suboptimaliteit: elke maand onafhankelijk opgelost.",
             f"Solver timeout per maand: {_LP_TIMELIMIT} s (CBC).",
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Expliciete vergelijking: eerst zonder batterij, dan met — verschil = besparing
+# ---------------------------------------------------------------------------
+
+def _maand_keys(index_of_df) -> pd.PeriodIndex:
+    if isinstance(index_of_df, pd.DatetimeIndex):
+        return index_of_df.to_period("M")
+    raise ValueError("DatetimeIndex vereist voor maandpiekberekening.")
+
+
+def bereken_kosten(
+    g_imp: np.ndarray,
+    g_exp: np.ndarray,
+    da_eur_mwh: np.ndarray,
+    ts: pd.DatetimeIndex,
+    tariff: TariffParams,
+) -> dict:
+    """
+    Kostenafrekening voor een import/export-profiel (kWh/kwartier).
+
+    Retourneert componenten in €:
+      energie_eur        — Σ g_imp · DA
+      netkost_var_eur    — Σ g_imp · (netkost + toeslagen)
+      capaciteit_eur     — Σ_maand maandpiek(kW) · maandtarief (met minimumpiek)
+      injectie_opbrengst_eur — Σ g_exp · injectievergoeding (negatief = opbrengst
+                               verlaagt totaal)
+      totaal_eur         — som van kosten minus injectie-opbrengst
+    """
+    da_kwh = np.asarray(da_eur_mwh, dtype=float) / 1000.0
+    g_imp = np.asarray(g_imp, dtype=float)
+    g_exp = np.asarray(g_exp, dtype=float)
+
+    energie = float((g_imp * da_kwh).sum())
+    netkost_var = float(
+        (g_imp * (tariff.netkost_afname_eur_kwh + tariff.toeslagen_afname_eur_kwh)).sum()
+    )
+
+    maand = _maand_keys(ts)
+    capaciteit = 0.0
+    piek_per_maand = {}
+    for mp in maand.unique():
+        mask = np.asarray(maand == mp)
+        piek_kw = max(g_imp[mask].max() / 0.25, tariff.cap_min_piek_kw)
+        piek_per_maand[str(mp)] = piek_kw
+        capaciteit += piek_kw * tariff.capaciteitstarief_eur_kw_maand
+
+    inj_verg = np.array([tariff.injectie_vergoeding_per_kwh(d) for d in da_kwh])
+    injectie_opbrengst = float((g_exp * inj_verg).sum())
+
+    return {
+        "energie_eur": energie,
+        "netkost_var_eur": netkost_var,
+        "capaciteit_eur": capaciteit,
+        "injectie_opbrengst_eur": injectie_opbrengst,
+        "totaal_eur": energie + netkost_var + capaciteit - injectie_opbrengst,
+        "piek_per_maand_kw": piek_per_maand,
+    }
+
+
+def vergelijk_zonder_met(
+    df: pd.DataFrame,
+    battery: BatteryParams,
+    tariff: TariffParams,
+    da_prices_eur_mwh: np.ndarray | None = None,
+) -> dict:
+    """
+    Kernworkflow: simuleer eerst ZONDER batterij, dan MET batterij (LP).
+    Het verschil in totale energiekost is de besparing door de batterij.
+
+    df: kolommen 'productie', 'consumptie' (kWh/kwartier), DatetimeIndex
+        (of 'timestamp'-kolom), optioneel 'da_prijs' (€/MWh).
+
+    Retourneert:
+      {"zonder": kosten_dict, "met": kosten_dict,
+       "besparing_eur": float, "res": LP-resultaat-DataFrame}
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if "timestamp" in df.columns:
+            df = df.set_index(pd.to_datetime(df["timestamp"]))
+        else:
+            raise ValueError("DatetimeIndex of 'timestamp'-kolom vereist.")
+
+    prod = df["productie"].to_numpy(dtype=float)
+    cons = df["consumptie"].to_numpy(dtype=float)
+
+    if da_prices_eur_mwh is not None:
+        da = np.asarray(da_prices_eur_mwh, dtype=float)
+    elif "da_prijs" in df.columns:
+        da = df["da_prijs"].to_numpy(dtype=float)
+    else:
+        raise ValueError("DA-prijzen vereist: kolom 'da_prijs' of da_prices_eur_mwh.")
+
+    # 1) Zonder batterij: import/export volgt rechtstreeks uit het profiel
+    g_imp_zonder = np.maximum(cons - prod, 0.0)
+    g_exp_zonder = np.maximum(prod - cons, 0.0)
+    kosten_zonder = bereken_kosten(g_imp_zonder, g_exp_zonder, da, df.index, tariff)
+
+    # 2) Met batterij: LP-geoptimaliseerde dispatch
+    res = simulate_lp(df, battery, tariff, da_prices_eur_mwh=da)
+    kosten_met = bereken_kosten(
+        res["g_imp"].to_numpy(), res["g_exp"].to_numpy(), da, df.index, tariff
+    )
+
+    return {
+        "zonder": kosten_zonder,
+        "met": kosten_met,
+        "besparing_eur": kosten_zonder["totaal_eur"] - kosten_met["totaal_eur"],
+        "res": res,
     }

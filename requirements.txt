@@ -2,3 +2,6 @@ numpy>=2.0
 pandas>=2.0
 pytest>=8.0
 pulp>=2.8
+entsoe-py>=0.6
+requests>=2.31
+pyxlsb>=1.0

@@ -174,8 +174,13 @@ class TestTotaleKostMetLagerDanZonder:
 
 
 class TestEigenverbruikBrugConstanteDA:
-    """§8.7: bij constante DA-prijs (geen arbitrageprikkel) mag LP-eigenverbruik
-    niet meer dan 1% afwijken van greedy eigenverbruik."""
+    """§8.7: bij constante DA-prijs (geen arbitrageprikkel) is er geen reden om
+    naar het net te ontladen (d_inj ≈ 0), en de LP-totaalkost mag nooit hoger
+    zijn dan die van de greedy dispatch op hetzelfde profiel.
+
+    NB: het exacte charge_pv-pad wordt bewust NIET vergeleken — bij constante
+    prijs is het LP indifferent over het laadpad zolang de totale kost gelijk
+    is, en aan het einde van de horizon laadt het LP correct niet meer op."""
 
     def test_eigenverbruik_brug_constante_da(self):
         n = 96  # 1 dag, één maand → LP en greedy dezelfde data
@@ -194,12 +199,30 @@ class TestEigenverbruikBrugConstanteDA:
         res_lp     = simulate_lp(df, bat, tariff)
         res_greedy = simulate_greedy(df, bat)
 
-        cp_lp     = res_lp["charge_pv"].sum()
-        cp_greedy = res_greedy["charge_pv"].sum()
+        # Geen arbitrageprikkel → geen injectie-ontlading
+        assert res_lp["discharge_inj"].sum() < 1e-6
 
-        if cp_greedy > 1e-9:
-            rel_diff = abs(cp_lp - cp_greedy) / cp_greedy
-            assert rel_diff < 0.01, f"Eigenverbruikverschil LP vs greedy: {rel_diff:.2%}"
+        # Totale gridkost: fysieke import/export per kwartier
+        da_kwh = da / 1000.0
+        imp_cost = da_kwh + tariff.netkost_afname_eur_kwh + tariff.toeslagen_afname_eur_kwh
+        inj_verg = np.array([tariff.injectie_vergoeding_per_kwh(d) for d in da_kwh])
+
+        # LP: g_imp/g_exp komen rechtstreeks uit de oplossing
+        kost_lp = (res_lp["g_imp"].to_numpy() * imp_cost).sum() \
+                - (res_lp["g_exp"].to_numpy() * inj_verg).sum()
+
+        # Greedy: fysieke netto netstroom uit de dispatch reconstrueren
+        eff = bat.efficiency
+        charge    = res_greedy["charge_pv"].to_numpy() + res_greedy["charge_da"].to_numpy()
+        discharge = -res_greedy["discharge"].to_numpy()   # positief, gross
+        net = cons - pv + charge - discharge * eff
+        g_imp_gr = np.maximum(net, 0.0)
+        g_exp_gr = np.maximum(-net, 0.0)
+        kost_greedy = (g_imp_gr * imp_cost).sum() - (g_exp_gr * inj_verg).sum()
+
+        assert kost_lp <= kost_greedy + 1e-6, (
+            f"LP-kost ({kost_lp:.2f} EUR) hoger dan greedy-kost ({kost_greedy:.2f} EUR)"
+        )
 
 
 class TestBesparingEnergieNegatief:
@@ -254,6 +277,71 @@ class TestMaandpiekCorrectBerekend:
             # We verifiëren via de output: de piek in g_imp moet ≤ gerapporteerde peak
             # We berekenen de impliciete peak uit de LP-resultaten
             assert g_imp_max_kw >= 0  # triviaal; echte check: geen g_imp boven peak
+
+
+class TestJaarbatenIsWerkelijkeKostendelta:
+    """De vijf besparingscomponenten moeten exact sommeren tot de werkelijke
+    kostendelta (kost zonder batterij − kost met batterij). Bewaakt o.a. dat
+    de injectie-opbrengst van de batterijloze baseline niet als batterijbaat
+    wordt geteld."""
+
+    def test_jaarbaten_is_werkelijke_kostendelta(self):
+        n = 96 * 7  # één week met PV-overschot én verbruik
+        ts = pd.date_range("2023-07-01", periods=n, freq="15min")
+        pv   = np.tile([0.0, 0.0, 9.0, 9.0], n // 4)
+        cons = np.full(n, 4.0)
+        da   = 60.0 + 40.0 * np.sin(np.arange(n) / 96 * 2 * np.pi)
+        df = pd.DataFrame({"productie": pv, "consumptie": cons, "da_prijs": da},
+                          index=ts)
+        tariff = _default_tariff(
+            netkost_afname_eur_kwh=0.05,
+            toeslagen_afname_eur_kwh=0.02,
+            capaciteitstarief_eur_kw_maand=4.0,
+            cap_min_piek_kw=2.5,
+        )
+        bat = _small_battery(capacity_kwh=30.0)
+        fin = FinancialParams()
+        res = simulate_lp(df, bat, tariff)
+        out = summarize_lp(res, bat, fin, tariff)
+
+        # Onafhankelijke herberekening van beide kostzijden
+        da_kwh = da / 1000.0
+        imp_cost = da_kwh + tariff.netkost_afname_eur_kwh + tariff.toeslagen_afname_eur_kwh
+        inj_verg = np.array([tariff.injectie_vergoeding_per_kwh(d) for d in da_kwh])
+
+        g_imp_met = res["g_imp"].to_numpy()
+        g_exp_met = res["g_exp"].to_numpy()
+        g_imp_zonder = np.maximum(cons - pv, 0.0)
+        g_exp_zonder = np.maximum(pv - cons, 0.0)
+
+        # Maandpiek (één maand in testdata), met minimumpiek
+        peak_met    = max(g_imp_met.max() / 0.25,    tariff.cap_min_piek_kw)
+        peak_zonder = max(g_imp_zonder.max() / 0.25, tariff.cap_min_piek_kw)
+
+        kost_met = (g_imp_met * imp_cost).sum() - (g_exp_met * inj_verg).sum() \
+                 + peak_met * tariff.capaciteitstarief_eur_kw_maand
+        kost_zonder = (g_imp_zonder * imp_cost).sum() - (g_exp_zonder * inj_verg).sum() \
+                    + peak_zonder * tariff.capaciteitstarief_eur_kw_maand
+
+        maintenance = bat.capacity_kwh * fin.battery_price_eur_per_kwh * fin.maintenance_frac
+        verwacht_jaarbaten = (kost_zonder - kost_met) - maintenance
+
+        assert out["financial"]["jaarbaten_eur"] == pytest.approx(verwacht_jaarbaten, abs=0.01)
+
+    def test_besparing_injectie_negatief_bij_pv_overschot(self):
+        """Batterij absorbeert PV-overschot → minder injectie dan baseline →
+        besparing_injectie_eur ≤ 0 (gemiste injectievergoeding)."""
+        n = 96
+        ts = pd.date_range("2023-08-01", periods=n, freq="15min")
+        pv   = np.tile([0.0, 0.0, 9.0, 9.0], n // 4)
+        cons = np.full(n, 4.0)
+        df = pd.DataFrame({"productie": pv, "consumptie": cons,
+                           "da_prijs": np.full(n, 80.0)}, index=ts)
+        tariff = _default_tariff()
+        bat = _small_battery(capacity_kwh=30.0)
+        res = simulate_lp(df, bat, tariff)
+        out = summarize_lp(res, bat, FinancialParams(), tariff)
+        assert out["financial"]["besparing_injectie_eur"] <= 1e-6
 
 
 class TestNetkostInjectieEnkelvoudig:
