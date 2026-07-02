@@ -1,0 +1,11 @@
+# Virtuele omgeving en caches
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Geheimen — nooit committen
+.entsoe_key
+.env
+
+# Lokale datacache (DA-prijzen e.d.)
+data/
