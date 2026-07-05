@@ -5,6 +5,7 @@ __pycache__/
 
 # Geheimen — nooit committen
 .entsoe_key
+.bess_api_key
 .env
 
 # Lokale datacache (DA-prijzen e.d.)

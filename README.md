@@ -50,12 +50,16 @@ uvicorn bess_api:app --host 0.0.0.0 --port 8000
 
 Interactieve documentatie: <http://localhost:8000/docs>
 
-| Endpoint | Doet |
-|---|---|
-| `GET /health` | Draait de server? |
-| `GET /netgebieden` | Beschikbare netgebieden (Fluvius, ORES, RESA, Sibelga) |
-| `POST /valideer` | CSV-meterdata uploaden + valideren → `profiel_id` |
-| `POST /simulatie` | Backtest zonder/met batterij + terugverdientijd |
+Bij de eerste start wordt automatisch een API-key aangemaakt in `.bess_api_key`
+(blijft lokaal, staat in .gitignore). Alle endpoints behalve `/health` vereisen
+die key als header: `x-api-key: <inhoud van .bess_api_key>`.
+
+| Endpoint | Key nodig | Doet |
+|---|---|---|
+| `GET /health` | nee | Draait de server? |
+| `GET /netgebieden` | ja | Beschikbare netgebieden (Fluvius, ORES, RESA, Sibelga) |
+| `POST /valideer` | ja | CSV-meterdata uploaden + valideren → `profiel_id` |
+| `POST /simulatie` | ja | Backtest zonder/met batterij + terugverdientijd |
 
 Voorbeeldrequest:
 
@@ -78,7 +82,7 @@ echte DA-prijzen 2022–2026 · backtest · kostenvergelijking · API · 98 test
 | # | Stap | Omvang | Waarom |
 |---|---|---|---|
 | 1 | ~~Documentatielaag (dit bestand, CLAUDE.md, skills)~~ | klein | ✅ |
-| 2 | API-beveiliging (`x-api-key`-header) | klein | Zodra de tunnel publiek is, kan anders iedereen de mini-pc laten rekenen |
+| 2 | ~~API-beveiliging (`x-api-key`-header)~~ | klein | ✅ |
 | 3 | Cloudflare Tunnel op de mini-pc | klein | Publieke HTTPS-URL zonder poorten open te zetten |
 | 4 | Lovable-dashboard tegen `openapi.json` | middel | De gebruikersinterface |
 | 5 | Test met echte Fluvius-export | klein | Valideert de ingest op het echte bestandsformaat |

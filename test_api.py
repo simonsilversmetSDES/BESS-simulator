@@ -11,11 +11,12 @@ import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from bess_api import app
+from bess_api import _API_KEY, app
 from bess_prices import _cache_pad
 from bess_profielen import _parsed_pad, _xlsb_pad
 
 client = TestClient(app)
+HEADERS = {"x-api-key": _API_KEY}
 
 _CACHE_AANWEZIG = (
     (_parsed_pad(2026).exists() or _xlsb_pad(2026).exists())
@@ -47,10 +48,40 @@ class TestHealth:
         assert r.json() == {"status": "ok"}
 
 
+class TestApiKeyBeveiliging:
+    def test_health_zonder_key_ok(self):
+        """Health blijft open voor tunnel- en uptime-checks."""
+        assert client.get("/health").status_code == 200
+
+    def test_simulatie_zonder_key_geweigerd(self):
+        r = client.post("/simulatie", json={
+            "profiel": {"type": "standaard", "jaarverbruik_kwh": 10000},
+            "batterij": {"capacity_kwh": 20},
+        })
+        assert r.status_code == 401
+
+    def test_simulatie_foute_key_geweigerd(self):
+        r = client.post("/simulatie", headers={"x-api-key": "fout-1234"}, json={
+            "profiel": {"type": "standaard", "jaarverbruik_kwh": 10000},
+            "batterij": {"capacity_kwh": 20},
+        })
+        assert r.status_code == 401
+
+    def test_valideer_zonder_key_geweigerd(self):
+        r = client.post(
+            "/valideer",
+            files={"file": ("meter.csv", _meter_csv(), "text/csv")},
+        )
+        assert r.status_code == 401
+
+    def test_netgebieden_zonder_key_geweigerd(self):
+        assert client.get("/netgebieden").status_code == 401
+
+
 @needs_cache
 class TestNetgebieden:
     def test_lijst_bevat_fluvius(self):
-        r = client.get("/netgebieden")
+        r = client.get("/netgebieden", headers=HEADERS)
         assert r.status_code == 200
         gebieden = r.json()["netgebieden"]
         assert any(g.startswith("Fluvius") for g in gebieden)
@@ -60,6 +91,7 @@ class TestValideer:
     def test_geldige_csv(self):
         r = client.post(
             "/valideer",
+            headers=HEADERS,
             files={"file": ("meter.csv", _meter_csv(), "text/csv")},
             data={"unit": "kWh"},
         )
@@ -72,6 +104,7 @@ class TestValideer:
     def test_ongeldige_csv_geeft_400(self):
         r = client.post(
             "/valideer",
+            headers=HEADERS,
             files={"file": ("kapot.csv", b"kolom_a,kolom_b\n1,2\n", "text/csv")},
             data={"unit": "kWh"},
         )
@@ -82,6 +115,7 @@ class TestValideer:
         csv = _meter_csv().decode().replace(",", ";").encode()
         r = client.post(
             "/valideer",
+            headers=HEADERS,
             files={"file": ("fluvius.csv", csv, "text/csv")},
             data={"unit": "kWh"},
         )
@@ -90,14 +124,14 @@ class TestValideer:
 
 class TestSimulatieValidatie:
     def test_onbekend_profiel_id_geeft_404(self):
-        r = client.post("/simulatie", json={
+        r = client.post("/simulatie", headers=HEADERS, json={
             "profiel": {"type": "upload", "profiel_id": "bestaat-niet"},
             "batterij": {"capacity_kwh": 20},
         })
         assert r.status_code == 404
 
     def test_ongeldige_crate_geeft_400(self):
-        r = client.post("/simulatie", json={
+        r = client.post("/simulatie", headers=HEADERS, json={
             "profiel": {"type": "standaard", "jaarverbruik_kwh": 10000},
             "batterij": {"capacity_kwh": 20, "crate": "1 op 99"},
         })
@@ -105,7 +139,7 @@ class TestSimulatieValidatie:
         assert "crate" in r.json()["detail"].lower()
 
     def test_negatief_jaarverbruik_geweigerd(self):
-        r = client.post("/simulatie", json={
+        r = client.post("/simulatie", headers=HEADERS, json={
             "profiel": {"type": "standaard", "jaarverbruik_kwh": -5},
             "batterij": {"capacity_kwh": 20},
         })
@@ -116,7 +150,7 @@ class TestSimulatieValidatie:
 class TestSimulatieIntegratie:
     def test_standaard_profiel_2026(self):
         """Volledige keten: standaardprofiel zonder PV → backtest 2026 YTD."""
-        r = client.post("/simulatie", json={
+        r = client.post("/simulatie", headers=HEADERS, json={
             "profiel": {"type": "standaard", "jaarverbruik_kwh": 20000, "kwp": 0},
             "batterij": {"capacity_kwh": 20},
             "jaren": [2026],
@@ -133,7 +167,7 @@ class TestSimulatieIntegratie:
         assert "beperkingen" in body
 
     def test_kostenuitsplitsing_aanwezig(self):
-        r = client.post("/simulatie", json={
+        r = client.post("/simulatie", headers=HEADERS, json={
             "profiel": {"type": "standaard", "jaarverbruik_kwh": 20000, "kwp": 0},
             "batterij": {"capacity_kwh": 20},
             "jaren": [2026],

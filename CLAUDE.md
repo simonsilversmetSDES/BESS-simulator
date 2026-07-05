@@ -40,7 +40,7 @@ in mensentaal, vermijd jargon zonder toelichting.
 
 ## Nooit doen
 
-- `.entsoe_key` of `data/` committen (staan in .gitignore; key is persoonlijk).
+- `.entsoe_key`, `.bess_api_key` of `data/` committen (staan in .gitignore; keys zijn geheim).
 - `simulate()` (greedy), `bess_ingest.py`, `conftest.py`, `test_bess.py` of
   `test_ingest.py` wijzigen zonder expliciete vraag van de gebruiker.
 - Testdrempels versoepelen of tests aanpassen om een falende test groen te

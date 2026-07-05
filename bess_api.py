@@ -20,13 +20,17 @@ na een herstart van de API moet de CSV opnieuw geüpload worden.
 from __future__ import annotations
 
 import io
+import os
+import pathlib
+import secrets
 import uuid
 from dataclasses import asdict
 from typing import Literal, Union
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from bess_backtest import backtest_jaren
@@ -46,6 +50,44 @@ from bess_profielen import (
 )
 
 _KWARTIEREN_PER_JAAR = 35040
+
+# ---------------------------------------------------------------------------
+# API-key-beveiliging
+#
+# De key komt uit (in volgorde): env var BESS_API_KEY, of het bestand
+# .bess_api_key in de projectroot. Bestaat geen van beide, dan wordt bij de
+# eerste start een veilige key gegenereerd en naar .bess_api_key geschreven
+# (staat in .gitignore). Alle endpoints behalve /health en /docs vereisen de
+# header:  x-api-key: <key>
+# ---------------------------------------------------------------------------
+
+_API_KEY_FILE = pathlib.Path(__file__).parent / ".bess_api_key"
+
+
+def _lees_of_maak_api_key() -> str:
+    env = os.environ.get("BESS_API_KEY")
+    if env:
+        return env.strip()
+    if _API_KEY_FILE.exists():
+        return _API_KEY_FILE.read_text(encoding="utf-8").strip()
+    key = secrets.token_urlsafe(32)
+    _API_KEY_FILE.write_text(key, encoding="utf-8")
+    print(f"Nieuwe API-key aangemaakt in {_API_KEY_FILE.name} — geef deze mee "
+          "als 'x-api-key'-header in het dashboard.")
+    return key
+
+
+_API_KEY = _lees_of_maak_api_key()
+_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+
+
+def vereis_api_key(key: str | None = Depends(_api_key_header)) -> None:
+    if key is None or not secrets.compare_digest(key, _API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="Ongeldige of ontbrekende x-api-key-header.",
+        )
+
 
 app = FastAPI(
     title="BESS-simulator API",
@@ -127,12 +169,12 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.get("/netgebieden")
+@app.get("/netgebieden", dependencies=[Depends(vereis_api_key)])
 def netgebieden() -> dict:
     return {"netgebieden": beschikbare_netgebieden()}
 
 
-@app.post("/valideer")
+@app.post("/valideer", dependencies=[Depends(vereis_api_key)])
 async def valideer(
     file: UploadFile = File(...),
     unit: str = Form("auto"),
@@ -174,7 +216,7 @@ async def valideer(
     }
 
 
-@app.post("/simulatie")
+@app.post("/simulatie", dependencies=[Depends(vereis_api_key)])
 def simulatie(req: SimulatieRequest) -> dict:
     """
     Backtest: het profiel wordt per jaar tegen de werkelijke Belgische
