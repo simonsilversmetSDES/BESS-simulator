@@ -59,6 +59,32 @@ def _leg_profiel_op_jaar(lookup: dict, prijzen: pd.Series) -> pd.DataFrame:
     )
 
 
+def _reken_jaar(
+    lookup: dict,
+    jaar: int,
+    battery: BatteryParams,
+    tariff: TariffParams,
+) -> tuple[dict, pd.DataFrame]:
+    """Rekent één prijsjaar door; retourneert (samenvattingsrij, LP-resultaat)."""
+    prijzen = haal_da_prijzen_jaar(jaar)
+    df_jaar = _leg_profiel_op_jaar(lookup, prijzen)
+    uit = vergelijk_zonder_met(df_jaar, battery, tariff)
+    rij = {
+        "jaar": jaar,
+        "kost_zonder_eur": uit["zonder"]["totaal_eur"],
+        "kost_met_eur": uit["met"]["totaal_eur"],
+        "besparing_eur": uit["besparing_eur"],
+        "da_gemiddeld_eur_mwh": float(prijzen.mean()),
+        "n_kwartieren": len(df_jaar),
+    }
+    # Kostenuitsplitsing per kant, voor grafieken in het dashboard
+    for kant in ("zonder", "met"):
+        for comp in ("energie_eur", "netkost_var_eur", "capaciteit_eur",
+                     "injectie_opbrengst_eur"):
+            rij[f"{kant}_{comp}"] = uit[kant][comp]
+    return rij, uit["res"]
+
+
 def backtest_jaren(
     profiel_df: pd.DataFrame,
     battery: BatteryParams,
@@ -72,26 +98,41 @@ def backtest_jaren(
                 (kWh/kwartier) en een DatetimeIndex of 'timestamp'-kolom.
 
     Retourneert per jaar (rijen): kost_zonder_eur, kost_met_eur, besparing_eur,
-    da_gemiddeld_eur_mwh, n_kwartieren.
+    da_gemiddeld_eur_mwh, n_kwartieren + kostenuitsplitsing per kant.
     """
     lookup = _profiel_lookup(profiel_df)
-    rijen = []
-    for jaar in jaren:
-        prijzen = haal_da_prijzen_jaar(jaar)
-        df_jaar = _leg_profiel_op_jaar(lookup, prijzen)
-        uit = vergelijk_zonder_met(df_jaar, battery, tariff)
-        rij = {
-            "jaar": jaar,
-            "kost_zonder_eur": uit["zonder"]["totaal_eur"],
-            "kost_met_eur": uit["met"]["totaal_eur"],
-            "besparing_eur": uit["besparing_eur"],
-            "da_gemiddeld_eur_mwh": float(prijzen.mean()),
-            "n_kwartieren": len(df_jaar),
-        }
-        # Kostenuitsplitsing per kant, voor grafieken in het dashboard
-        for kant in ("zonder", "met"):
-            for comp in ("energie_eur", "netkost_var_eur", "capaciteit_eur",
-                         "injectie_opbrengst_eur"):
-                rij[f"{kant}_{comp}"] = uit[kant][comp]
-        rijen.append(rij)
+    rijen = [_reken_jaar(lookup, jaar, battery, tariff)[0] for jaar in jaren]
     return pd.DataFrame(rijen).set_index("jaar")
+
+
+def backtest_met_grafieken(
+    profiel_df: pd.DataFrame,
+    battery: BatteryParams,
+    tariff: TariffParams,
+    jaren: tuple[int, ...] = (2022, 2023, 2024, 2025, 2026),
+) -> dict:
+    """
+    Zelfde backtest als backtest_jaren(), maar retourneert ook de dashboard-
+    grafiekdata per jaar: Sankey-energiestromen, uurprofiel en maandkosten.
+
+    Retourneert {"tabel": DataFrame, "grafieken": {jaar: {sankey, uurprofiel,
+    maandkosten}}}.
+    """
+    from bess_grafieken import maandkosten_data, sankey_data, stromen_per_kwartier, uurprofiel_data
+
+    lookup = _profiel_lookup(profiel_df)
+    rijen = []
+    grafieken: dict[str, dict] = {}
+    for jaar in jaren:
+        rij, res = _reken_jaar(lookup, jaar, battery, tariff)
+        rijen.append(rij)
+        stromen = stromen_per_kwartier(res, battery)
+        grafieken[str(jaar)] = {
+            "sankey": sankey_data(stromen),
+            "uurprofiel": uurprofiel_data(stromen),
+            "maandkosten": maandkosten_data(res, tariff),
+        }
+    return {
+        "tabel": pd.DataFrame(rijen).set_index("jaar"),
+        "grafieken": grafieken,
+    }

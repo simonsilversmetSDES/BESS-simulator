@@ -33,7 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-from bess_backtest import backtest_jaren
+from bess_backtest import backtest_met_grafieken
 from bess_core import (
     CRATE_DELERS,
     BatteryParams,
@@ -263,11 +263,12 @@ def simulatie(req: SimulatieRequest) -> dict:
         var_netkost_eur_kwh=req.tarief.var_netkost_eur_kwh,
     )
 
-    # --- Backtest ---
+    # --- Backtest (incl. grafiekdata per jaar) ---
     try:
-        tabel = backtest_jaren(profiel, batterij, tarief, jaren=tuple(req.jaren))
+        uit = backtest_met_grafieken(profiel, batterij, tarief, jaren=tuple(req.jaren))
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+    tabel = uit["tabel"]
 
     # --- Terugverdientijd ---
     fin = req.financieel
@@ -287,6 +288,7 @@ def simulatie(req: SimulatieRequest) -> dict:
 
     return {
         "jaren": tabel.reset_index().to_dict(orient="records"),
+        "grafieken": uit["grafieken"],
         "terugverdientijd": {
             "investering_eur": investering,
             "onderhoud_eur_jaar": onderhoud_jaar,

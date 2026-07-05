@@ -166,6 +166,20 @@ class TestSimulatieIntegratie:
         assert tvt["investering_eur"] > 0
         assert "beperkingen" in body
 
+    def test_grafiekdata_aanwezig(self):
+        r = client.post("/simulatie", headers=HEADERS, json={
+            "profiel": {"type": "standaard", "jaarverbruik_kwh": 20000, "kwp": 0},
+            "batterij": {"capacity_kwh": 20},
+            "jaren": [2026],
+        })
+        grafieken = r.json()["grafieken"]
+        assert "2026" in grafieken
+        g = grafieken["2026"]
+        assert {"sankey", "uurprofiel", "maandkosten"} <= set(g)
+        assert len(g["uurprofiel"]) == 24
+        assert all(l["mwh"] > 0 for l in g["sankey"]["links"])
+        assert len(g["maandkosten"]) >= 6   # 2026 YTD = minstens 6 maanden
+
     def test_kostenuitsplitsing_aanwezig(self):
         r = client.post("/simulatie", headers=HEADERS, json={
             "profiel": {"type": "standaard", "jaarverbruik_kwh": 20000, "kwp": 0},
